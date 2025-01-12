@@ -1,0 +1,11 @@
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+__pycache__/
+**/__pycache__/
+*.t7
+*.pth
+*.bin
+cifar10@*
+cifar100@*
+logs/*
+data/*

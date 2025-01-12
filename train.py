@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 import random
+from pathlib import Path
 
 import numpy as np
 
@@ -14,23 +15,39 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data as data
+from torchvision import models
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 
-import models.wideresnet as models
-import dataset.cifar10 as dataset
+from io import BytesIO
+from PIL import Image
+import requests
+
+# import models.wideresnet as models
+import dataset.cifar10 as cifar10_  
+import dataset.cifar100 as cifar100_
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+
+from tqdm import tqdm
 from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
-parser.add_argument('--epochs', default=1024, type=int, metavar='N',
+parser.add_argument("--model", default="resnet50", type=str, metavar='N',
+                    help='an adversary model that learns from labeled/unlabeled data')
+parser.add_argument("--dataset", default="cifar10", type=str, metavar='N',
+                    help='dataset')
+parser.add_argument("--mode", default="none", type=str, 
+                    help="ground_truth or upstream")
+parser.add_argument("--eps", default=-1.0, type=float, 
+                    help="epsilon; the level of defense from upstream")
+parser.add_argument('--epochs', default=20, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--batch-size', default=64, type=int, metavar='N',
                     help='train batchsize')
-parser.add_argument('--lr', '--learning-rate', default=0.002, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
                     metavar='LR', help='initial learning rate')
 # Checkpoints
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -56,8 +73,16 @@ parser.add_argument('--ema-decay', default=0.999, type=float)
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
 
+if args.mode == "none": 
+    raise ValueError(f"mode must be specified")
+if args.mode == "upstream" and args.eps == -1.0:
+    raise ValueError(f"if mode = upstream , eps (epsilon) must be specified: {args.eps}")
+
+
 # Use CUDA
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+print(f"Using GPU ID: {args.gpu}")
+# os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu # duplicate command? 
+DEVICE = torch.device(f"cuda:{args.gpu}") 
 use_cuda = torch.cuda.is_available()
 
 # Random seed
@@ -67,43 +92,84 @@ np.random.seed(args.manualSeed)
 
 best_acc = 0  # best test accuracy
 
+cifar10_mean = (0.4914, 0.4822, 0.4465) 
+cifar10_std = (0.2471, 0.2435, 0.2616) 
+cifar100_mean = (0.5071, 0.4867, 0.4408)
+cifar100_std = (0.2675, 0.2565, 0.2761)
+
 def main():
     global best_acc
 
     if not os.path.isdir(args.out):
         mkdir_p(args.out)
 
+    global _n_classes
+    global _accuracy, _latency # model spec 
+    global _mean, _std
+
+    if args.dataset == "cifar10":
+        _n_classes = 10 
+    elif args.dataset == "cifar100":
+        _n_classes = 100
+    else: 
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
+    if args.dataset == "cifar10":
+        _mean, _std = cifar10_mean, cifar10_std
+    elif args.dataset == "cifar100":
+        _mean, _std = cifar100_mean, cifar100_std
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
+    # For resnet56 (as victim model in model zoo)
+    if args.dataset == "cifar10":
+        _accuracy, _latency = 94.3, 42.77
+    elif args.dataset == "cifar100":
+        _accuracy, _latency = 75.16, 41.82
+    else: 
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
+    # Dataset
+    if args.dataset == "cifar10":
+        _mean = cifar10_mean
+        _std = cifar10_std
+    elif args.dataset == "cifar100":
+        _mean = cifar100_mean
+        _std = cifar100_std
+    else: 
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
     # Data
-    print(f'==> Preparing cifar10')
+    print(f'==> Preparing {args.dataset}')
+
     transform_train = transforms.Compose([
-        dataset.RandomPadandCrop(32),
-        dataset.RandomFlip(),
-        dataset.ToTensor(),
+        transforms.ToPILImage(),
+        transforms.RandomResizedCrop(32),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_mean, std=_std)
     ])
 
     transform_val = transforms.Compose([
-        dataset.ToTensor(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_mean, std=_std)
     ])
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    datadir = Path().home() / "dataset"
+    if args.dataset == "cifar10":
+        train_labeled_set, train_unlabeled_set, val_set, test_set = cifar10_.get_cifar10(datadir, args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    elif args.dataset == "cifar100":
+        train_labeled_set, train_unlabeled_set, val_set, test_set = cifar100_.get_cifar100(datadir, args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Model
-    print("==> creating WRN-28-2")
-
-    def create_model(ema=False):
-        model = models.WideResNet(num_classes=10)
-        model = model.cuda()
-
-        if ema:
-            for param in model.parameters():
-                param.detach_()
-
-        return model
-
+    print(f"==> creating {args.model}")
     model = create_model()
     ema_model = create_model(ema=True)
 
@@ -150,13 +216,13 @@ def main():
 
         step = args.train_iteration * (epoch + 1)
 
-        writer.add_scalar('losses/train_loss', train_loss, step)
-        writer.add_scalar('losses/valid_loss', val_loss, step)
-        writer.add_scalar('losses/test_loss', test_loss, step)
+        writer.add_scalar('losses/train_loss', train_loss, epoch + 1)
+        writer.add_scalar('losses/valid_loss', val_loss, epoch + 1)
+        writer.add_scalar('losses/test_loss', test_loss, epoch + 1)
 
-        writer.add_scalar('accuracy/train_acc', train_acc, step)
-        writer.add_scalar('accuracy/val_acc', val_acc, step)
-        writer.add_scalar('accuracy/test_acc', test_acc, step)
+        writer.add_scalar('accuracy/train_acc', train_acc, epoch + 1)
+        writer.add_scalar('accuracy/val_acc', val_acc, epoch + 1)
+        writer.add_scalar('accuracy/test_acc', test_acc, epoch + 1)
 
         # append logger file
         logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc])
@@ -198,106 +264,123 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     unlabeled_train_iter = iter(unlabeled_trainloader)
 
     model.train()
-    for batch_idx in range(args.train_iteration):
-        try:
-            inputs_x, targets_x = labeled_train_iter.next()
-        except:
-            labeled_train_iter = iter(labeled_trainloader)
-            inputs_x, targets_x = labeled_train_iter.next()
+    with tqdm(range(args.train_iteration), desc="Training Progress", unit="batch") as progress_bar:
+        for batch_idx in progress_bar:
+            try:
+                inputs_x, targets_x = next(labeled_train_iter)
+            except:
+                labeled_train_iter = iter(labeled_trainloader)
+                inputs_x, targets_x = next(labeled_train_iter)
 
-        try:
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
-        except:
-            unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            try:
+                (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
+            except:
+                unlabeled_train_iter = iter(unlabeled_trainloader)
+                (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
 
-        # measure data loading time
-        data_time.update(time.time() - end)
+            # measure data loading time
+            data_time.update(time.time() - end)
 
-        batch_size = inputs_x.size(0)
+            batch_size = inputs_x.size(0)
+            """"""""""""
+            if args.mode == "ground_truth": 
+                targets_x = torch.zeros(batch_size, _n_classes).scatter_(1, targets_x.view(-1,1).long(), 1)
+            elif args.mode == "upstream": 
+                targets_x = get_labels_from_upstream(inputs_x)
+            else:
+                raise ValueError(f"Unsupported mode: {args.mode}") 
+            """"""""""""
 
-        # Transform label to one-hot
-        targets_x = torch.zeros(batch_size, 10).scatter_(1, targets_x.view(-1,1).long(), 1)
+            if use_cuda:
+                inputs_x, targets_x = inputs_x.to(DEVICE), targets_x.to(DEVICE, non_blocking=True)
+                inputs_u = inputs_u.to(DEVICE)
+                inputs_u2 = inputs_u2.to(DEVICE)
 
-        if use_cuda:
-            inputs_x, targets_x = inputs_x.cuda(), targets_x.cuda(non_blocking=True)
-            inputs_u = inputs_u.cuda()
-            inputs_u2 = inputs_u2.cuda()
+            with torch.no_grad():
+                # compute guessed labels of unlabel samples
+                outputs_u = model(inputs_u)
+                outputs_u2 = model(inputs_u2)
+                p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1)) / 2
+                pt = p**(1/args.T)
+                targets_u = pt / pt.sum(dim=1, keepdim=True)
+                targets_u = targets_u.detach()
 
+            # mixup
+            all_inputs = torch.cat([inputs_x, inputs_u, inputs_u2], dim=0)
+            all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
 
-        with torch.no_grad():
-            # compute guessed labels of unlabel samples
-            outputs_u = model(inputs_u)
-            outputs_u2 = model(inputs_u2)
-            p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1)) / 2
-            pt = p**(1/args.T)
-            targets_u = pt / pt.sum(dim=1, keepdim=True)
-            targets_u = targets_u.detach()
+            l = np.random.beta(args.alpha, args.alpha)
 
-        # mixup
-        all_inputs = torch.cat([inputs_x, inputs_u, inputs_u2], dim=0)
-        all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
+            l = max(l, 1-l)
 
-        l = np.random.beta(args.alpha, args.alpha)
+            idx = torch.randperm(all_inputs.size(0))
 
-        l = max(l, 1-l)
+            input_a, input_b = all_inputs, all_inputs[idx]
+            target_a, target_b = all_targets, all_targets[idx]
 
-        idx = torch.randperm(all_inputs.size(0))
+            mixed_input = l * input_a + (1 - l) * input_b
+            mixed_target = l * target_a + (1 - l) * target_b
 
-        input_a, input_b = all_inputs, all_inputs[idx]
-        target_a, target_b = all_targets, all_targets[idx]
+            # interleave labeled and unlabed samples between batches to get correct batchnorm calculation 
+            mixed_input = list(torch.split(mixed_input, batch_size))
+            mixed_input = interleave(mixed_input, batch_size)
 
-        mixed_input = l * input_a + (1 - l) * input_b
-        mixed_target = l * target_a + (1 - l) * target_b
+            logits = [model(mixed_input[0])]
+            for input in mixed_input[1:]:
+                logits.append(model(input))
 
-        # interleave labeled and unlabed samples between batches to get correct batchnorm calculation 
-        mixed_input = list(torch.split(mixed_input, batch_size))
-        mixed_input = interleave(mixed_input, batch_size)
+            # put interleaved samples back
+            logits = interleave(logits, batch_size)
+            logits_x = logits[0]
+            logits_u = torch.cat(logits[1:], dim=0)
 
-        logits = [model(mixed_input[0])]
-        for input in mixed_input[1:]:
-            logits.append(model(input))
+            Lx, Lu, w = criterion(logits_x, mixed_target[:batch_size], logits_u, mixed_target[batch_size:], epoch+batch_idx/args.train_iteration)
 
-        # put interleaved samples back
-        logits = interleave(logits, batch_size)
-        logits_x = logits[0]
-        logits_u = torch.cat(logits[1:], dim=0)
+            loss = Lx + w * Lu
 
-        Lx, Lu, w = criterion(logits_x, mixed_target[:batch_size], logits_u, mixed_target[batch_size:], epoch+batch_idx/args.train_iteration)
+            # record loss
+            losses.update(loss.item(), inputs_x.size(0))
+            losses_x.update(Lx.item(), inputs_x.size(0))
+            losses_u.update(Lu.item(), inputs_x.size(0))
+            ws.update(w, inputs_x.size(0))
 
-        loss = Lx + w * Lu
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            ema_optimizer.step()
 
-        # record loss
-        losses.update(loss.item(), inputs_x.size(0))
-        losses_x.update(Lx.item(), inputs_x.size(0))
-        losses_u.update(Lu.item(), inputs_x.size(0))
-        ws.update(w, inputs_x.size(0))
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        ema_optimizer.step()
+            # plot progress
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
+                        batch=batch_idx + 1,
+                        size=args.train_iteration,
+                        data=data_time.avg,
+                        bt=batch_time.avg,
+                        total=bar.elapsed_td,
+                        eta=bar.eta_td,
+                        loss=losses.avg,
+                        loss_x=losses_x.avg,
+                        loss_u=losses_u.avg,
+                        w=ws.avg,
+                        )
+            bar.next()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            progress_bar.set_postfix({
+                "Data": f"{data_time.avg:.3f}s",
+                "Batch": f"{batch_time.avg:.3f}s",
+                "Total": bar.elapsed_td,
+                "ETA": bar.eta_td,
+                "Loss": f"{losses.avg:.4f}",
+                "Loss_x": f"{losses_x.avg:.4f}",
+                "Loss_u": f"{losses_u.avg:.4f}",
+                "W": f"{ws.avg:.4f}",
+            })
 
-        # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
-                    batch=batch_idx + 1,
-                    size=args.train_iteration,
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    loss_x=losses_x.avg,
-                    loss_u=losses_u.avg,
-                    w=ws.avg,
-                    )
-        bar.next()
-    bar.finish()
+        bar.finish()
 
     return (losses.avg, losses_x.avg, losses_u.avg,)
 
@@ -320,7 +403,7 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
             data_time.update(time.time() - end)
 
             if use_cuda:
-                inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE, non_blocking=True)
             # compute output
             outputs = model(inputs)
             loss = criterion(outputs, targets)
@@ -348,11 +431,70 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
                         top5=top5.avg,
                         )
             bar.next()
+
         bar.finish()
     return (losses.avg, top1.avg)
 
+def create_model(ema=False):
+    
+    if args.model == 'resnet50':
+        m = models.resnet50(pretrained=True)
+        m.fc = nn.Linear(m.fc.in_features, _n_classes)
+    else:
+        raise NotImplementedError
+    
+    m = m.to(DEVICE)
+
+    if ema:
+        for param in m.parameters():
+            param.detach_()
+
+    return m
+
+def get_labels_from_upstream(inputs_x):
+    """
+    Queries the upstream API for outputs (soft labels) for MixMatch training.
+    Args:
+        inputs_x (Tensor): Batch of input images (labeled data).
+    Returns:
+        logits (Tensor): Soft labels obtained from the upstream system.
+    """
+    logits = []
+    image_payloads = []
+
+    # Convert inputs_x to image payloads
+    for img in inputs_x:
+        img = img.cpu().numpy().transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
+        img = (img * np.array(_std) + np.array(_mean))  # Reverse normalization
+        img = (img * 255).clip(0, 255).astype(np.uint8)  # Convert to 0-255
+        buffer = BytesIO()
+        Image.fromarray(img).save(buffer, format="JPEG")
+        buffer.seek(0)
+        image_payloads.append(("files", ("image.jpg", buffer, "image/jpeg")))
+
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:8000/mz/b_secure_classify_?accuracy={_accuracy}&latency={_latency}&eps={args.eps}",
+            files=image_payloads
+        )
+        response.raise_for_status()
+        batch_outputs = response.json()
+        logits = [output["probs"] for output in batch_outputs] # use probabiility, not raw outputs
+
+    except requests.exceptions.RequestException as e:
+        print(f"API call failed: {e}")
+        logits = [[0] * _n_classes] * len(inputs_x)  # Dummy output on failure
+
+    finally:
+        for _, (_, buffer, _) in image_payloads:
+            buffer.close()
+
+    return torch.tensor(logits, dtype=torch.float32)
+
 def save_checkpoint(state, is_best, checkpoint=args.out, filename='checkpoint.pth.tar'):
+    
     filepath = os.path.join(checkpoint, filename)
+    print(f"save_checkpoint... {filepath}")
     torch.save(state, filepath)
     if is_best:
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
