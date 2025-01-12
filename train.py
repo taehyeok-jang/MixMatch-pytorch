@@ -35,7 +35,7 @@ parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
 parser.add_argument("--model", default="resnet50", type=str, metavar='N',
                     help='an adversary model that learns from labeled/unlabeled data')
-parser.add_argument("--dataset", default="cifar10", type=str, metavar='N',
+parser.add_argument("--dataset", default="cifar100", type=str, metavar='N',
                     help='dataset')
 parser.add_argument("--mode", default="none", type=str, 
                     help="ground_truth or upstream")
@@ -47,7 +47,7 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--batch-size', default=64, type=int, metavar='N',
                     help='train batchsize')
-parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float,
                     metavar='LR', help='initial learning rate')
 # Checkpoints
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
